@@ -1,0 +1,11 @@
+# Generated datasets, caches, checkpoints, and experiment results
+/outputs/
+
+# Python bytecode and runtime logs
+__pycache__/
+*.py[cod]
+*.log
+
+# Local agent configuration
+/.agents/
+/.codex/
