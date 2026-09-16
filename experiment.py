@@ -14,6 +14,28 @@ DEFAULT_DATA = '/home/PublicData/qc-data/SCA/Data_new'
 CLASSES = ['Hping3', 'dirsearch', 'gobuster', 'nmap port', 'nmap version', 'normal', 'sql', 'xssser']
 MODES = ('rf', 'rf_frequency', 'raw_cnn', 'zscore_cnn', 'stft_cnn')
 WINDOW_SECONDS = (0.5, 1.0, 2.0, 5.0)
+BEHAVIORS = ['normal', 'Hping3', 'directory_enumeration', 'network_reconnaissance', 'web_injection']
+BEHAVIOR_MAP = {'normal': 'normal', 'Hping3': 'Hping3', 'dirsearch': 'directory_enumeration',
+                'gobuster': 'directory_enumeration', 'nmap port': 'network_reconnaissance',
+                'nmap version': 'network_reconnaissance', 'sql': 'web_injection', 'xssser': 'web_injection'}
+
+
+def task_definition(task):
+    if task == 'binary':
+        return ['normal', 'attack'], [int(c != 'normal') for c in CLASSES]
+    if task == 'behavior':
+        return BEHAVIORS, [BEHAVIORS.index(BEHAVIOR_MAP[c]) for c in CLASSES]
+    if task == 'multiclass':
+        return CLASSES, list(range(len(CLASSES)))
+    raise ValueError(f'Unknown task: {task}')
+
+
+def parse_tasks(value):
+    tasks = tuple(dict.fromkeys(x.strip() for x in value.split(',')))
+    if not tasks or any(t not in ('binary', 'multiclass', 'behavior') for t in tasks):
+        raise argparse.ArgumentTypeError('Tasks: binary,multiclass,behavior')
+    return tasks
+
 
 
 def write_json(path, value):
@@ -123,6 +145,29 @@ def check_split(split, rows):
     assert not (a & b or a & c or b & c), 'Session leakage'
     assert a | b | c == {r['session'] for r in rows}, 'Missing sessions'
     assert all(len(split[x]) == len(set(split[x])) for x in split)
+
+
+def make_unseen_splits(rows, seed):
+    """Seven held-out tools x two held-out normal sessions; unseen tools NEVER in val."""
+    rng = random.Random(seed)
+    groups = {c: sorted(r['session'] for r in rows if r['label'] == c) for c in CLASSES}
+    assert len(groups['normal']) == 2, 'This protocol requires the two recorded normal sessions'
+    for sessions in groups.values():
+        rng.shuffle(sessions)
+    folds, metadata = [], []
+    for attack in (c for c in CLASSES if c != 'normal'):
+        for rotation, normal in enumerate(groups['normal']):
+            split = dict(train=[], val=[], test=groups[attack] + [normal])
+            for c, sessions in groups.items():
+                remaining = [s for s in sessions if s not in split['test']]
+                val = [remaining[(CLASSES.index(attack) + rotation) % len(remaining)]] if len(remaining) >= 2 else []
+                split['val'].extend(val)
+                split['train'].extend(s for s in remaining if s not in val)
+            check_split(split, rows)
+            assert not set(groups[attack]) & set(split['train'] + split['val'])
+            folds.append(split)
+            metadata.append(dict(held_out_attack=attack, normal_rotation=rotation, normal_test_session=normal))
+    return folds, metadata
 
 
 def cache_directory(args):
@@ -301,15 +346,24 @@ def frequency_statistics(x, sample_rate):
     return np.column_stack(columns).astype(np.float32), names
 
 
-def balanced_ids(split, session_ids, label_map, binary, seed):
+def balanced_ids(split, session_ids, label_map, binary, seed, task=None):
     rng = np.random.default_rng(seed)
     size = sum(len(session_ids[s]) for s in split['train'])
-    unit = 14 if binary else len(CLASSES)
+    active = [c for c in range(len(CLASSES)) if any(label_map[s] == c for s in split['train'])]
+    attacks = len(active) - 1
+    # Behavior: 2 parts each for normal/Hping3, 1 part per tool in the three paired groups.
+    unit = 10 if task == 'behavior' else 2 * attacks if binary else len(active)
     size = max(unit, ((size + unit - 1) // unit) * unit)
     drawn, audit = [], []
     for c, name in enumerate(CLASSES):
         sessions = [s for s in split['train'] if label_map[s] == c]
-        quota = size // unit * (7 if binary and name == 'normal' else 1)
+        if not sessions:
+            continue
+        if task == 'behavior':
+            multiplier = 2 if name in ('normal', 'Hping3') else 1
+        else:
+            multiplier = attacks if binary and name == 'normal' else 1
+        quota = size // unit * multiplier
         shuffled = rng.permutation(sessions).tolist()
         for i, session in enumerate(shuffled):
             count = quota // len(sessions) + int(i < quota % len(sessions))
@@ -336,12 +390,14 @@ def aggregate_probabilities(indices, probabilities, size):
     if size <= 0 or len(indices) != len(probabilities):
         raise ValueError('Invalid aggregation inputs')
     assert np.all(np.diff(indices) > 0), 'Window indices must be strictly increasing'
+    if size == 1:
+        return np.arange(len(indices), dtype=np.int64), probabilities.copy()
     ends = np.arange(size - 1, len(indices), dtype=np.int64)
     ends = ends[indices[ends] - indices[ends - size + 1] == size - 1]
     cumulative = np.vstack([np.zeros((1, probabilities.shape[1])),
                             np.cumsum(probabilities, axis=0, dtype=np.float64)])
     averaged = (cumulative[ends + 1] - cumulative[ends - size + 1]) / size
-    return ends, averaged
+    return ends, np.clip(averaged, 0., 1.)
 
 
 def metric(y, probabilities, n):
@@ -387,11 +443,23 @@ def run(args):
     assert config['smoke'] == args.smoke
     assert config['window_seconds'] == args.window_seconds, 'Wrong window cache'
     rows = config['sessions']
+    assert config['folds'] == make_splits(rows, config['seed']), 'Stored folds changed'
+    if args.protocol == 'unseen':
+        if tuple(args.tasks) != ('binary',):
+            raise ValueError('Unseen-attack evaluation requires --tasks binary')
+        folds, fold_metadata = make_unseen_splits(rows, config['seed'])
+    else:
+        folds, fold_metadata = config['folds'], [{} for _ in config['folds']]
     model_tag = '-'.join(args.models)
     aggregation_tag = '-'.join(map(str, args.aggregations))
     result_dir = cache.parent / (('smoke_results' if args.smoke else 'results') +
                                  f'_{args.sampling}_{args.augmentation}_m-{model_tag}_a-{aggregation_tag}')
+    if args.protocol != 'loso' or tuple(args.tasks) != ('binary', 'multiclass'):
+        result_dir = result_dir.with_name(result_dir.name + f'_p-{args.protocol}_t-' + '-'.join(args.tasks))
     result_dir.mkdir(parents=True, exist_ok=True)
+    write_csv(result_dir / 'session_splits.csv', [dict(fold=k, split=part, **fold_metadata[k], **row)
+              for k, split in enumerate(folds) for part, sessions in split.items()
+              for row in rows if row['session'] in sessions])
     for name in ('summary.json', 'metrics.json', 'training_sampling.csv'):
         (result_dir / name).unlink(missing_ok=True)
 
@@ -470,20 +538,19 @@ def run(args):
                 x = torch.log1p(z.abs().square())[:, None]
             return self.head(self.body(x).mean(dim=-1).flatten(1))
 
-    def labels(ids, binary):
-        return np.concatenate([np.full(len(indices[s]), int(label_map[s] != CLASSES.index('normal'))
-                               if binary else label_map[s], dtype=np.int64) for s in ids])
-
     epochs = 1 if args.smoke else args.epochs
     settings = dict(
         vars(args), models=list(args.models), aggregations=list(args.aggregations), split_seed=config['seed'],
+        evaluation_folds=folds, fold_metadata=fold_metadata, behavior_mapping=BEHAVIOR_MAP,
+        task_names={task: task_definition(task)[0] for task in args.tasks},
         effective_epochs=epochs, effective_batch_size=batch_size, window_seconds=config['window_seconds'],
         target_rate_hz=config['target_rate_hz'], dataset=str((cache / 'dataset.json').resolve()),
         numpy_version=np.__version__, torch_version=torch.__version__,
         sklearn_version=__import__('sklearn').__version__, scipy_version=__import__('scipy').__version__,
         pandas_version=__import__('pandas').__version__,
         checkpoint_selection='fixed final epoch; validation is diagnostic only',
-        primary_metrics='pooled held-out predictions; per-fold macro metrics are diagnostic because each fold has one test class',
+        primary_metrics=('equal-fold means per held-out attack; no pooled score over repeated attack sessions' if args.protocol == 'unseen' else
+                         'pooled held-out predictions; per-fold macro metrics are diagnostic because each fold has one test class'),
         feature_names=STAT_NAMES,
         frequency_feature_names=STAT_NAMES + frequency_names if need_frequency else [],
         aggregation='Trailing stride-one probability mean within one contiguous test session only',
@@ -494,22 +561,21 @@ def run(args):
     sampling_audit = []
     cpu_session_ids = {s: ids.cpu().numpy() for s, ids in session_ids.items()}
     pooled = {}
-    assert config['folds'] == make_splits(rows, config['seed']), 'Stored folds changed'
-    for fold_id, split in enumerate(config['folds']):
+    for fold_id, split in enumerate(folds):
         check_split(split, rows)
         batch_ids = {part: torch.cat([session_ids[s] for s in ids]) for part, ids in split.items()}
-        for task in ('binary', 'multiclass'):
+        for task in args.tasks:
             binary = task == 'binary'
-            targets = (all_labels != CLASSES.index('normal')).long() if binary else all_labels
-            names = ['normal', 'attack'] if binary else CLASSES
+            names, mapping = task_definition(task)
+            targets = torch.tensor(mapping, device=device)[all_labels]
             n = len(names)
-            ys = {part: labels(ids, binary) for part, ids in split.items()}
+            ys = {part: targets[batch_ids[part]].cpu().numpy() for part in split}
             assert set(ys['train']) == set(range(n)), 'Training class missing'
             epoch_ids = []
             for epoch in range(epochs):
                 if args.sampling == 'balanced':
                     selected, audit = balanced_ids(split, cpu_session_ids, label_map, binary,
-                                                   config['seed'] + fold_id + epoch * 1000)
+                                                   config['seed'] + fold_id + epoch * 1000, task=task)
                 else:
                     selected = batch_ids['train'].cpu().numpy().copy()
                     np.random.default_rng(config['seed'] + fold_id + epoch * 1000).shuffle(selected)
@@ -606,7 +672,7 @@ def run(args):
                     truth = np.concatenate(truth_chunks)
                     prob = np.concatenate(probability_chunks)
                     scores = dict(
-                        fold=fold_id, task=task, model=mode, aggregation=aggregation,
+                        fold=fold_id, task=task, model=mode, aggregation=aggregation, **fold_metadata[fold_id],
                         observation_seconds=aggregation * args.window_seconds,
                         test_windows=len(truth), source_test_windows=len(ys['test']),
                         coverage=len(truth) / len(ys['test']),
@@ -632,7 +698,7 @@ def run(args):
     for (task, mode, aggregation), chunks in pooled.items():
         group = [r for r in results if r['task'] == task and r['model'] == mode and r['aggregation'] == aggregation]
         truth, prob = (np.concatenate([pair[i] for pair in chunks]) for i in (0, 1))
-        pooled_scores = metric(truth, prob, 2 if task == 'binary' else 8)
+        pooled_scores = metric(truth, prob, len(task_definition(task)[0]))
         diagnostic = {}
         for key in pooled_scores:
             values = [r[key] for r in group if r[key] is not None]
@@ -645,16 +711,29 @@ def run(args):
             observation_seconds=aggregation * args.window_seconds,
             folds=len(group), valid_folds=sum(r['test_windows'] > 0 for r in group),
             test_windows=len(truth), source_test_windows=sum(r['source_test_windows'] for r in group),
-            pooled=pooled_scores,
-            session_accuracy=dict(mean=float(np.mean(session_accuracy)), std=float(np.std(session_accuracy)),
+            pooled=pooled_scores if args.protocol == 'loso' else None,
+            session_accuracy=dict(mean=float(np.mean(session_accuracy)) if session_accuracy else None,
+                                  std=float(np.std(session_accuracy)) if session_accuracy else None,
                                   sessions=len(session_accuracy)),
             fold_diagnostics=diagnostic))
-        if task == 'multiclass':
+        if args.protocol == 'unseen':
+            summary[-1]['primary_metrics'] = diagnostic
+            attack_metrics = {}
+            for attack in (c for c in CLASSES if c != 'normal'):
+                attack_metrics[attack] = {}
+                for key in pooled_scores:
+                    values = [r[key] for r in group if r['held_out_attack'] == attack and r[key] is not None]
+                    attack_metrics[attack][key] = dict(mean=float(np.mean(values)) if values else None,
+                                                       valid_rotations=len(values))
+            summary[-1]['held_out_attack_metrics'] = attack_metrics
+            summary[-1]['note'] = 'Primary: equal-fold means. Attack sessions repeat across normal rotations; do not pool as independent observations.'
+            summary[-1].pop('session_accuracy')
+        if task != 'binary':
             save_cm(result_dir / f'{task}_{mode}_aggregate{aggregation}_pooled_confusion.csv',
-                    truth, prob.argmax(axis=1), CLASSES)
+                    truth, prob.argmax(axis=1), task_definition(task)[0])
     write_json(result_dir / 'summary.json', summary)
     print(f'Completed {len(results)} evaluations; all session leakage assertions passed.', flush=True)
-    print('Use summary.json -> pooled as the primary result; session_accuracy is the equal-session diagnostic.', flush=True)
+    print('Use summary.json -> primary_metrics for unseen, pooled for LOSO.', flush=True)
 
 
 def main():
@@ -668,6 +747,8 @@ def main():
     prepare_parser.add_argument('--window-seconds', type=float, choices=WINDOW_SECONDS, default=1.0)
     prepare_parser.add_argument('--target-rate', type=int, default=100000)
     run_parser = commands.add_parser('run', help='Evaluate selected models on both tasks')
+    run_parser.add_argument('--tasks', type=parse_tasks, default=('binary', 'multiclass'))
+    run_parser.add_argument('--protocol', choices=['loso', 'unseen'], default='loso')
     run_parser.add_argument('--window-seconds', type=float, choices=WINDOW_SECONDS, default=1.0)
     run_parser.add_argument('--models', type=parse_models, default=parse_models('all'),
                             help='Comma-separated models or all')
@@ -686,12 +767,25 @@ def main():
     for command in (prepare_parser, run_parser):
         command.add_argument('--smoke', action='store_true',
                              help='Bounded session prefixes; one epoch; RF uses 10 trees')
+    analyze_parser = commands.add_parser('analyze', help='Analyze saved single-window probabilities; no training')
+    analyze_parser.add_argument('--results', required=True, type=Path)
+    analyze_parser.add_argument('--aggregations', type=parse_int_list, default=(1, 3, 5, 10))
+    compare_parser = commands.add_parser('compare', help='Collect LOSO summaries and matched augmentation contrasts')
+    compare_parser.add_argument('--results', nargs='+', type=Path, required=True)
+    compare_parser.add_argument('--destination', type=Path, default=Path('outputs/rq_comparison'))
     args = parser.parse_args()
     for name in ('window_seconds', 'target_rate', 'epochs', 'batch_size', 'learning_rate',
                  'threads', 'max_batch_points', 'smoke_windows'):
         if hasattr(args, name) and getattr(args, name) <= 0:
             parser.error(f'{name} must be positive')
-    {'inspect': inspect_data, 'prepare': prepare, 'run': run}[args.command](args)
+    if args.command == 'analyze':
+        from rq_analysis import analyze
+        analyze(args)
+    elif args.command == 'compare':
+        from rq_analysis import compare
+        compare(args)
+    else:
+        {'inspect': inspect_data, 'prepare': prepare, 'run': run}[args.command](args)
 
 
 if __name__ == '__main__':

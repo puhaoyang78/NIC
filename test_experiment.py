@@ -6,7 +6,7 @@ from pathlib import Path
 
 import numpy as np
 
-from experiment import CLASSES, check_split, make_splits, prepare, statistics, load_signal_tensor, iter_batches, cache_directory, balanced_ids, frequency_statistics, aggregate_probabilities, metric, augment_signal, save_cm
+from experiment import CLASSES, check_split, make_splits, prepare, statistics, load_signal_tensor, iter_batches, cache_directory, balanced_ids, frequency_statistics, aggregate_probabilities, metric, augment_signal, save_cm, make_unseen_splits, task_definition, BEHAVIORS
 
 
 class ExperimentTests(unittest.TestCase):
@@ -27,6 +27,122 @@ class ExperimentTests(unittest.TestCase):
         broken['val'].append(broken['test'][0])
         with self.assertRaisesRegex(AssertionError, 'Session leakage'):
             check_split(broken, rows)
+
+    def test_unseen_protocol_and_behavior_sampling(self):
+        rows = [dict(session=f'{c}/{i}.csv', label=c)
+                for c, count in zip(CLASSES, [3, 2, 3, 4, 5, 2, 3, 3]) for i in range(count)]
+        folds, metadata = make_unseen_splits(rows, 42)
+        self.assertEqual(len(folds), 14)
+        self.assertEqual((folds, metadata), make_unseen_splits(rows, 42))
+        label_map = {r['session']: CLASSES.index(r['label']) for r in rows}
+        ids = {r['session']: np.arange(i * 10, i * 10 + 10) for i, r in enumerate(rows)}
+        for split, meta in zip(folds, metadata):
+            check_split(split, rows)
+            unknown = {r['session'] for r in rows if r['label'] == meta['held_out_attack']}
+            self.assertTrue(unknown <= set(split['test']))
+            self.assertFalse(unknown & set(split['train'] + split['val']))
+            self.assertEqual(sum(s.startswith('normal/') for s in split['test']), 1)
+            selected, audit = balanced_ids(split, ids, label_map, True, 42)
+            self.assertEqual(sum(r['draws'] for r in audit if r['label'] == 'normal'), len(selected) // 2)
+            counts = [sum(r['draws'] for r in audit if r['label'] == c)
+                      for c in CLASSES if c not in ('normal', meta['held_out_attack'])]
+            self.assertEqual(len(set(counts)), 1)
+        names, mapping = task_definition('behavior')
+        self.assertEqual(names, BEHAVIORS)
+        for split in make_splits(rows, 42):
+            selected, audit = balanced_ids(split, ids, label_map, False, 42, task='behavior')
+            quotas = [sum(r['draws'] for r in audit if mapping[CLASSES.index(r['label'])] == c) for c in range(5)]
+            self.assertEqual(len(set(quotas)), 1)
+            self.assertEqual(sum(quotas), len(selected))
+
+    def test_saved_prediction_validation(self):
+        from rq_analysis import read_predictions
+        import csv
+        names, _ = task_definition('multiclass')
+        rows = {'normal/a.csv': dict(label='normal', candidate_windows=4, excluded_window_indices=[2])}
+        split = dict(train=[], val=[], test=['normal/a.csv'])
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / 'pred.csv'
+            def write(session='normal/a.csv', positions=(0, 1, 3)):
+                with path.open('w', newline='') as f:
+                    writer = csv.writer(f)
+                    writer.writerow(['session','start_window','end_window','true_label','predicted_label',
+                                     *['probability_' + n for n in names]])
+                    for i in positions:
+                        writer.writerow([session,i,i,'normal','normal',0,0,0,0,0,1,0,0])
+            write()
+            data = read_predictions(path, split, rows, names, 'multiclass')
+            self.assertEqual(data['normal/a.csv'][0].tolist(), [0, 1, 3])
+            text = path.read_text()
+            path.write_text(text.replace(',1,0,0', ',1.0000000000000002,0,0'))
+            read_predictions(path, split, rows, names, 'multiclass')
+            path.write_text(text.replace(',1,0,0', ',1.1,0,0'))
+            with self.assertRaisesRegex(AssertionError, 'Invalid probabilities'):
+                read_predictions(path, split, rows, names, 'multiclass')
+            write(session='normal/train.csv')
+            with self.assertRaisesRegex(AssertionError, 'Prediction sessions'):
+                read_predictions(path, split, rows, names, 'multiclass')
+            write(positions=(0, 1, 2))
+            with self.assertRaises(AssertionError):
+                read_predictions(path, split, rows, names, 'multiclass')
+
+    def test_analysis_common_endpoints_and_compare(self):
+        from rq_analysis import analyze, compare
+        from experiment import write_csv, write_json
+        rows = [dict(session=f'{c}/{i}.csv', label=c, candidate_windows=12,
+                     excluded_window_indices=[5] if i == 0 else [], source_window_samples=1000)
+                for c, count in zip(CLASSES, [3, 2, 3, 4, 5, 2, 3, 3]) for i in range(count)]
+        folds = make_splits(rows, 42)
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            dataset = root / 'dataset.json'
+            write_json(dataset, dict(sessions=rows, folds=folds, seed=42, target_window_samples=1000))
+            source = root / 'signal'
+            config = dict(dataset=str(dataset), models=['rf'], tasks=['multiclass'], window_seconds=1,
+                          augmentation='signal', effective_batch_size=8, split_seed=42, effective_epochs=20,
+                          learning_rate=.001, sampling='balanced', target_rate_hz=1000, checkpoint_selection='final',
+                          smoke=True, numpy_version=np.__version__, torch_version='fixture')
+            write_json(source / 'config.json', config)
+            records = []
+            for k, split in enumerate(folds):
+                session = split['test'][0]
+                row = next(r for r in rows if r['session'] == session)
+                label = CLASSES.index(row['label'])
+                predictions = []
+                for i in range(12):
+                    if i in row['excluded_window_indices']:
+                        continue
+                    q = np.zeros(8)
+                    q[label], q[(label + 1) % 8] = ((.2, .8) if i == 0 else (.8, .2))
+                    predictions.append(dict(session=session, start_window=i, end_window=i,
+                        true_label=CLASSES[label], predicted_label=CLASSES[q.argmax()],
+                        **{'probability_' + name: float(q[j]) for j, name in enumerate(CLASSES)}))
+                write_csv(source / f'fold{k}_multiclass_rf_aggregate1_predictions.csv', predictions)
+                records.append(dict(fold=k, task='multiclass', model='rf', aggregation=1))
+            write_json(source / 'metrics.json', records)
+            write_json(source / 'summary.json', [dict(task='multiclass', model='rf', aggregation=1,
+                       test_windows=292, pooled=dict(accuracy=.6, macro_f1=.6))])
+            analyze(argparse.Namespace(results=source, aggregations=(1, 3, 5, 10)))
+            results = json.loads((source / 'analysis_a-1-3-5-10/summary.json').read_text())
+            self.assertEqual(len(results), 4)
+            self.assertEqual({r['common_windows'] for r in results}, {51})
+            self.assertTrue(all(r['common_endpoint_metrics']['macro_f1'] == 1 for r in results))
+            self.assertLess(results[0]['pooled']['accuracy'], 1)
+            self.assertLess(results[-1]['valid_folds'], 25)
+            # Paired ablation arithmetic and rejection of a mismatched epoch budget.
+            for augmentation, f1 in [('signal', .7), ('none', .6)]:
+                directory = root / ('compare_' + augmentation)
+                write_json(directory / 'config.json', dict(config, models=['raw_cnn'], augmentation=augmentation))
+                write_json(directory / 'summary.json', [dict(task='multiclass', model='raw_cnn', aggregation=1,
+                           test_windows=292, pooled=dict(accuracy=f1, macro_f1=f1))])
+            args = argparse.Namespace(results=[root / 'compare_signal', root / 'compare_none'], destination=root / 'comparison')
+            compare(args)
+            effects = json.loads((root / 'comparison/augmentation_effects.json').read_text())
+            self.assertAlmostEqual(effects[0]['delta_signal_minus_none']['macro_f1'], .1)
+            changed = dict(config, models=['raw_cnn'], augmentation='none', effective_epochs=10)
+            write_json(root / 'compare_none/config.json', changed)
+            with self.assertRaisesRegex(AssertionError, 'effective_epochs'):
+                compare(args)
 
     def test_energy_features(self):
         x = np.array([[1., -1., 1., -1.], [2., 2., 2., 2.]])
@@ -106,6 +222,8 @@ class ExperimentTests(unittest.TestCase):
     def test_aggregation_gaps_empty_and_binary_metrics(self):
         indices = np.array([0, 1, 2, 4, 5, 6, 7])
         p = np.column_stack([np.arange(7) / 10, 1 - np.arange(7) / 10])
+        _, exact = aggregate_probabilities(indices, p, 1)
+        np.testing.assert_array_equal(exact, p)
         ends, averaged = aggregate_probabilities(indices, p, 3)
         self.assertEqual(ends.tolist(), [2, 5, 6])
         np.testing.assert_allclose(averaged, [p[:3].mean(0), p[3:6].mean(0), p[4:7].mean(0)])
