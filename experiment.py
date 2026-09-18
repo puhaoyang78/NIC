@@ -773,6 +773,10 @@ def main():
     compare_parser = commands.add_parser('compare', help='Collect LOSO summaries and matched augmentation contrasts')
     compare_parser.add_argument('--results', nargs='+', type=Path, required=True)
     compare_parser.add_argument('--destination', type=Path, default=Path('outputs/rq_comparison'))
+    session_parser = commands.add_parser('session-analysis', help='Dirsearch and held-out nmap session diagnostics; no training')
+    session_parser.add_argument('--loso-results', type=Path, required=True)
+    session_parser.add_argument('--unseen-results', type=Path, required=True)
+    session_parser.add_argument('--destination', type=Path, default=Path('outputs/session_analysis'))
     args = parser.parse_args()
     for name in ('window_seconds', 'target_rate', 'epochs', 'batch_size', 'learning_rate',
                  'threads', 'max_batch_points', 'smoke_windows'):
@@ -781,6 +785,9 @@ def main():
     if args.command == 'analyze':
         from rq_analysis import analyze
         analyze(args)
+    elif args.command == 'session-analysis':
+        from rq_analysis import session_analysis
+        session_analysis(args)
     elif args.command == 'compare':
         from rq_analysis import compare
         compare(args)

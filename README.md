@@ -167,3 +167,20 @@ conda run --no-capture-output -n vul-detect python experiment.py analyze \
 同一未知攻击 session 会在两种 normal 留出配置下测试，normal 也会在不同攻击留出实验中重复出现，因此不把 14 折预测拼接成独立样本总体计算 pooled 分数。配置与逐行划分表保存 held_out_attack、normal_rotation 和测试 normal 来源。
 
 这里的 unseen 指该轮模型训练/验证未见该攻击工具；不是新漏洞识别或从未被研究者观察过的数据。当前 2 秒配置来自已完成的探索性 LOSO 比较，新增实验固定这个配置，不再用未知攻击测试结果调参。
+
+## 按独立采集分析 dirsearch 与 held-out nmap
+
+只读取正式 2 秒单窗预测，不重训，不改变原标签、划分或 argmax 判定：
+
+```bash
+conda run --no-capture-output -n vul-detect python -u experiment.py session-analysis \
+  --loso-results outputs/window_2s/results_balanced_signal_m-rf-rf_frequency-raw_cnn-zscore_cnn-stft_cnn_a-1 \
+  --unseen-results outputs/window_2s/results_balanced_signal_m-rf-rf_frequency-raw_cnn-zscore_cnn-stft_cnn_a-1_p-unseen_t-binary \
+  --destination outputs/session_analysis
+```
+
+输出 `dirsearch_sessions.csv`（每个原 CSV 的窗口数、正确/gobuster/sql/其他计数与比例、完整八类预测分布）、`nmap_session_rotations.csv`（每个原 CSV、每个 normal 轮换的 recall、attack 预测比例和概率统计）、`nmap_session_means.csv`（每个原 CSV 的两轮等权平均）和 `session_analysis.json`（相同数据、来源路径与统计定义）。
+
+`sql` 保留原标签，表示 SQL injection；`other` 排除正确 dirsearch、gobuster 和 sql，四个桶互斥且覆盖全部有效窗口。概率 std 使用总体标准差（ddof=0），Q25/Q75 使用线性插值。CSV/JSON 的比例均为 0–1，终端显示百分比。
+
+nmap 表保留 fold、normal_rotation、normal_test_session 与原预测文件路径。两轮平均不拼接窗口、不翻倍独立采集数；平均表中的 std/median/Q25/Q75 是两轮对应统计量的算术平均，不是合并样本或先平均概率后的统计量。因为所选窗口的真实标签全为 attack，attack recall 与预测为 attack 的比例相等。读取时重新检查完整测试窗口覆盖、标签、预测类别、session 互斥，并将所用完整折的指标与已保存的正式指标核对。

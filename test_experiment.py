@@ -144,6 +144,37 @@ class ExperimentTests(unittest.TestCase):
             with self.assertRaisesRegex(AssertionError, 'effective_epochs'):
                 compare(args)
 
+    def test_session_diagnostics_counts_probability_stats_and_rotations(self):
+        from rq_analysis import dirsearch_statistics, attack_statistics, average_attack_rotations
+        labels = ['dirsearch', 'gobuster', 'sql', 'Hping3', 'gobuster']
+        probabilities = np.eye(8)[[CLASSES.index(c) for c in labels]]
+        counts = dirsearch_statistics(probabilities)
+        self.assertEqual([counts[k + '_count'] for k in ('correct', 'gobuster', 'sql', 'other')], [1, 2, 1, 1])
+        self.assertEqual(counts['gobuster_fraction'], .4)
+        self.assertEqual(sum(counts['predicted_' + c + '_count'] for c in CLASSES), 5)
+        probabilities = np.array([[.5, .5], [.2, .8], [.8, .2], [.1, .9]])
+        stats = attack_statistics(probabilities)
+        self.assertEqual(stats['attack_count'], 2)  # Saved argmax tie is normal.
+        self.assertEqual(stats['attack_recall'], stats['predicted_attack_fraction'])
+        np.testing.assert_allclose([stats['probability_mean'], stats['probability_median'],
+                                   stats['probability_std'], stats['probability_q25'], stats['probability_q75']],
+                                  [.6, .65, np.sqrt(.075), .425, .825])
+        rotations = [dict(session='nmap port/a.csv', held_out_attack='nmap port', fold=i,
+                          normal_rotation=i, normal_test_session=f'normal/{i}.csv',
+                          **attack_statistics(np.tile([1 - p, p], (3, 1)))) for i, p in enumerate((.9, .1))]
+        row = average_attack_rotations(rotations)[0]
+        self.assertEqual(row['independent_sessions'], 1)
+        self.assertEqual(row['windows_per_rotation'], 3)
+        self.assertEqual(row['mean_attack_count'], 1.5)
+        self.assertEqual(row['mean_attack_recall'], .5)
+        self.assertAlmostEqual(row['mean_probability_mean'], .5)
+        self.assertAlmostEqual(row['mean_probability_std'], 0)  # Not pooled std=0.4.
+        with self.assertRaisesRegex(AssertionError, 'distinct normal rotations'):
+            average_attack_rotations([rotations[0], rotations[0]])
+        changed = dict(rotations[1], window_count=4)
+        with self.assertRaisesRegex(AssertionError, 'coverage'):
+            average_attack_rotations([rotations[0], changed])
+
     def test_energy_features(self):
         x = np.array([[1., -1., 1., -1.], [2., 2., 2., 2.]])
         np.testing.assert_allclose(statistics(x), [[1, 4, 1, 2, 0, 1, 1], [2, 16, 0, 0, 2, 2, 2]])

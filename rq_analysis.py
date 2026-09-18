@@ -212,3 +212,150 @@ def compare(args):
     write_csv(output / 'comparison.csv', [{k: row.get(k) for k in columns} for row in table])
     write_json(output / 'augmentation_effects.json', effects)
     print(f'Collected {len(table)} configurations; {len(effects)} matched augmentation contrasts: {output}', flush=True)
+
+
+def dirsearch_statistics(probabilities):
+    """Disjoint error buckets plus the complete original eight-label distribution."""
+    counts = np.bincount(probabilities.argmax(axis=1), minlength=len(CLASSES))
+    windows = len(probabilities)
+    correct, gobuster, sql = (int(counts[CLASSES.index(c)]) for c in ('dirsearch', 'gobuster', 'sql'))
+    result = dict(window_count=windows)
+    for name, count in [('correct', correct), ('gobuster', gobuster), ('sql', sql),
+                        ('other', windows - correct - gobuster - sql)]:
+        result[name + '_count'] = count
+        result[name + '_fraction'] = count / windows
+    for label, count in zip(CLASSES, counts):
+        result['predicted_' + label + '_count'] = int(count)
+        result['predicted_' + label + '_fraction'] = float(count / windows)
+    return result
+
+
+def attack_statistics(probabilities):
+    """All observations here have true label attack; preserve the saved argmax rule."""
+    attack = probabilities[:, 1]
+    count = int((probabilities.argmax(axis=1) == 1).sum())
+    return dict(window_count=len(attack), attack_count=count, attack_recall=count / len(attack),
+                predicted_attack_fraction=count / len(attack), probability_mean=float(attack.mean()),
+                probability_median=float(np.median(attack)), probability_std=float(attack.std(ddof=0)),
+                probability_q25=float(np.quantile(attack, .25, method='linear')),
+                probability_q75=float(np.quantile(attack, .75, method='linear')))
+
+
+def average_attack_rotations(records):
+    averages = []
+    for session in sorted({r['session'] for r in records}):
+        pair = sorted([r for r in records if r['session'] == session], key=lambda r: r['normal_rotation'])
+        assert len(pair) == 2 and [r['normal_rotation'] for r in pair] == [0, 1], 'Need both distinct normal rotations'
+        assert len({r['normal_test_session'] for r in pair}) == 2
+        assert len({r['fold'] for r in pair}) == 2
+        assert pair[0]['window_count'] == pair[1]['window_count'], 'Changed session coverage across rotations'
+        assert pair[0]['held_out_attack'] == pair[1]['held_out_attack']
+        row = dict(session=session, held_out_attack=pair[0]['held_out_attack'], independent_sessions=1,
+                   rotation_count=2, windows_per_rotation=pair[0]['window_count'],
+                   fold_rotation0=pair[0]['fold'], fold_rotation1=pair[1]['fold'],
+                   normal_test_rotation0=pair[0]['normal_test_session'],
+                   normal_test_rotation1=pair[1]['normal_test_session'])
+        for key in ('attack_count', 'attack_recall', 'predicted_attack_fraction', 'probability_mean',
+                    'probability_median', 'probability_std', 'probability_q25', 'probability_q75'):
+            row['mean_' + key] = float(np.mean([r[key] for r in pair]))
+        averages.append(row)
+    return averages
+
+
+def session_analysis(args):
+    """Requested 2 s dirsearch STFT and held-out nmap raw-CNN session diagnostics."""
+    dirsearch_rows, nmap_rows, sources = [], [], {}
+    for protocol, task, model, directory in (
+            ('loso', 'multiclass', 'stft_cnn', args.loso_results),
+            ('unseen', 'binary', 'raw_cnn', args.unseen_results)):
+        directory = Path(directory).resolve()
+        config = json.loads((directory / 'config.json').read_text())
+        assert not config['smoke'] and config['window_seconds'] == 2, 'Need formal 2 s results'
+        assert config.get('protocol', 'loso') == protocol and model in config['models']
+        assert task in config.get('tasks', ['binary', 'multiclass'])
+        summary = json.loads((directory / 'summary.json').read_text())
+        assert any(r['task'] == task and r['model'] == model and r['aggregation'] == 1 for r in summary)
+        dataset = json.loads(Path(config['dataset']).read_text())
+        rows = {r['session']: r for r in dataset['sessions']}
+        if protocol == 'unseen':
+            expected_folds, metadata = make_unseen_splits(dataset['sessions'], dataset['seed'])
+            assert config['fold_metadata'] == metadata, 'Changed rotation metadata'
+        else:
+            expected_folds = make_splits(dataset['sessions'], dataset['seed'])
+            metadata = [{} for _ in expected_folds]
+        folds = config.get('evaluation_folds', dataset['folds'])
+        assert folds == expected_folds, 'Changed evaluation folds'
+        saved_metrics = [r for r in json.loads((directory / 'metrics.json').read_text())
+                         if r['task'] == task and r['model'] == model and r['aggregation'] == 1]
+        assert len(saved_metrics) == len(folds) and {r['fold'] for r in saved_metrics} == set(range(len(folds)))
+        names = task_definition(task)[0]
+        assert config.get('task_names', {}).get(task, names) == names
+        expected_sessions = {r['session'] for r in rows.values() if r['label'] in
+                             (('dirsearch',) if protocol == 'loso' else ('nmap port', 'nmap version'))}
+        found = []
+        for fold_id, split in enumerate(folds):
+            check_split(split, dataset['sessions'])
+            if protocol == 'unseen':
+                if metadata[fold_id]['held_out_attack'] not in ('nmap port', 'nmap version'):
+                    continue
+            elif not set(split['test']) & expected_sessions:
+                continue
+            path = directory / f'fold{fold_id}_{task}_{model}_aggregate1_predictions.csv'
+            sessions = read_predictions(path, split, rows, names, task)
+            # Reconcile the complete selected fold with its existing official evaluation.
+            y = np.concatenate([v[1] for v in sessions.values()])
+            prob = np.concatenate([v[2] for v in sessions.values()])
+            original = next(r for r in saved_metrics if r['fold'] == fold_id)
+            for key, value in metric(y, prob, len(names)).items():
+                if value is None:
+                    assert original[key] is None
+                else:
+                    np.testing.assert_allclose(value, original[key], rtol=1e-10, atol=1e-12)
+            for session, (_, truth, probabilities) in sessions.items():
+                if session not in expected_sessions:
+                    continue
+                found.append(session)
+                provenance = dict(session=session, fold=fold_id, source_predictions=str(path))
+                if protocol == 'loso':
+                    dirsearch_rows.append(dict(**provenance, **dirsearch_statistics(probabilities)))
+                else:
+                    assert rows[session]['label'] == metadata[fold_id]['held_out_attack']
+                    assert np.all(truth == 1)
+                    nmap_rows.append(dict(**provenance, **metadata[fold_id], **attack_statistics(probabilities)))
+        assert set(found) == expected_sessions
+        assert all(found.count(s) == (1 if protocol == 'loso' else 2) for s in expected_sessions)
+        sources[protocol] = dict(results=str(directory), dataset=config['dataset'], task=task,
+                                 model=model, window_seconds=2, aggregation=1)
+    dirsearch_rows.sort(key=lambda r: r['session'])
+    nmap_rows.sort(key=lambda r: (r['session'], r['normal_rotation']))
+    averages = average_attack_rotations(nmap_rows)
+    output = Path(args.destination)
+    write_csv(output / 'dirsearch_sessions.csv', dirsearch_rows)
+    write_csv(output / 'nmap_session_rotations.csv', nmap_rows)
+    write_csv(output / 'nmap_session_means.csv', averages)
+    write_json(output / 'session_analysis.json', dict(
+        sources=sources,
+        definitions=dict(fractions='All fractions and probabilities are in [0,1], not percentages.',
+            other='Predictions excluding correct dirsearch, gobuster, and sql; sql is the original SQL injection label.',
+            decision='Original argmax over saved probabilities; ties retain the original first-label rule.',
+            probability_std='Population standard deviation within one session and one rotation (ddof=0).',
+            quantiles='Q25/Q75: numpy quantile with linear interpolation.',
+            session_means='Equal arithmetic mean of the two per-rotation statistics; no concatenation of windows. Mean std/quantiles are NOT pooled std/quantiles.',
+            independence='One original CSV is one independent session. windows_per_rotation is not doubled. Attack recall equals predicted attack fraction because all selected windows are attacks.'),
+        dirsearch_sessions=dirsearch_rows, nmap_session_rotations=nmap_rows, nmap_session_means=averages))
+    print('dirsearch / 2s STFT-CNN (count and percentage of all valid session windows):')
+    for r in dirsearch_rows:
+        print(f'  {r["session"]}: n={r["window_count"]}; ' + '; '.join(
+            f'{key}={r[key + "_count"]} ({r[key + "_fraction"]:.2%})' for key in ('correct', 'gobuster', 'sql', 'other')))
+    print('nmap / held-out attack / 2s raw CNN (rotations are repeated evaluations of the SAME session):')
+    for r in nmap_rows:
+        print(f'  {r["session"]} fold={r["fold"]} rotation={r["normal_rotation"]} normal={r["normal_test_session"]}: '
+              f'n={r["window_count"]}, recall=attack_fraction={r["attack_recall"]:.2%}, '
+              f'p mean/median/std={r["probability_mean"]:.4f}/{r["probability_median"]:.4f}/{r["probability_std"]:.4f}, '
+              f'Q25/Q75={r["probability_q25"]:.4f}/{r["probability_q75"]:.4f}')
+    print('Per-session two-rotation means (not new independent acquisitions):')
+    for r in averages:
+        print(f'  {r["session"]}: n={r["windows_per_rotation"]} per rotation, '
+              f'mean recall={r["mean_attack_recall"]:.2%}, mean probability={r["mean_probability_mean"]:.4f}')
+    print(f'Saved {len(dirsearch_rows)} dirsearch sessions; {len(nmap_rows)} nmap rotation rows for '
+          f'{len(averages)} independent nmap sessions. Output: {output.resolve()}')
